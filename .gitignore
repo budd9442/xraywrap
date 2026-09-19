@@ -1,0 +1,12 @@
+# your real server config - has your VLESS UUID + Reality keys in it
+etc/config.env
+
+# downloaded binaries - install.sh/bin/xraywrap fetch these fresh
+vendor/*
+
+# runtime state: pidfiles, state.env, logs
+var/run/*
+var/log/*
+
+# macOS
+.DS_Store

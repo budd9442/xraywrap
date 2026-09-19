@@ -1,0 +1,721 @@
+#!/usr/bin/env bash
+# xraywrap - manage a system-wide Xray (VLESS+Reality) tunnel on macOS.
+#
+#   xraywrap install            download xray + tun2socks binaries
+#   xraywrap start [tun|socks]  bring the tunnel up (default: tun)
+#   xraywrap stop               tear it down, restoring routes/DNS exactly
+#   xraywrap restart [tun|socks]
+#   xraywrap status             show whether it's up + external IP
+#   xraywrap doctor             connectivity / loop-risk / clock-skew checks
+#   xraywrap logs [xray|tun2socks] [-f]
+#   xraywrap panic              hard reset: kill everything, restore networking,
+#                                regardless of what the state file says
+#   xraywrap enable             install + load a launchd job: tun mode starts at boot
+#   xraywrap disable            remove that launchd job (tunnel itself untouched)
+#   xraywrap uninstall          remove vendored binaries + runtime state (+ disable)
+#
+# Run install.sh once to put `xraywrap` on your PATH; after that all of the
+# above works as plain `xraywrap <command>` from anywhere.
+#
+# "tun" mode redirects the whole machine's traffic through the tunnel via a
+# virtual utun interface (tun2socks) feeding Xray's local SOCKS5 inbound.
+# "socks" mode just sets Xray's SOCKS5 as the macOS system proxy (lower risk,
+# but only proxy-aware apps honor it).
+#
+# start/stop/restart/panic require root (they touch the routing table and
+# system network settings). Run them with sudo.
+
+set -euo pipefail
+
+# Resolve our real location even when invoked through a symlink (e.g.
+# /usr/local/bin/xraywrap -> this file), so ROOT still points at the real
+# project directory instead of /usr/local/bin.
+_src="${BASH_SOURCE[0]}"
+while [ -h "$_src" ]; do
+  _dir="$(cd -P "$(dirname "$_src")" && pwd)"
+  _src="$(readlink "$_src")"
+  [[ "$_src" != /* ]] && _src="$_dir/$_src"
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$_src")" && pwd)"
+unset _src _dir
+
+ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+ETC_DIR="$ROOT/etc"
+VENDOR_DIR="$ROOT/vendor"
+VAR_DIR="$ROOT/var"
+RUN_DIR="$VAR_DIR/run"
+LOG_DIR="$VAR_DIR/log"
+
+CONFIG_FILE="$ETC_DIR/config.env"
+XRAY_CONFIG="$RUN_DIR/xray-client.json"
+STATE_FILE="$RUN_DIR/state.env"
+XRAY_PIDFILE="$RUN_DIR/xray.pid"
+TUN2SOCKS_PIDFILE="$RUN_DIR/tun2socks.pid"
+XRAY_LOG="$LOG_DIR/xray.log"
+TUN2SOCKS_LOG="$LOG_DIR/tun2socks.log"
+
+XRAY_BIN="$VENDOR_DIR/xray"
+TUN2SOCKS_BIN="$VENDOR_DIR/tun2socks"
+
+mkdir -p "$RUN_DIR" "$LOG_DIR"
+
+# ---------- helpers ----------
+
+log()  { printf '[xraywrap] %s\n' "$*"; }
+err()  { printf '[xraywrap] ERROR: %s\n' "$*" >&2; }
+die()  { err "$*"; exit 1; }
+
+require_macos() {
+  [[ "$(uname -s)" == "Darwin" ]] || die "this wrapper is macOS-only (uses utun/pf-free routing tricks specific to Darwin)."
+}
+
+need_root() {
+  if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+    die "must run as root (changes routes / system network settings). Try: sudo $0 $*"
+  fi
+}
+
+load_config() {
+  [[ -f "$CONFIG_FILE" ]] || die "missing config: $CONFIG_FILE (copy $ETC_DIR/config.env.example and fill in your server)"
+  set -a
+  # shellcheck disable=SC1090
+  source "$CONFIG_FILE"
+  set +a
+  : "${XRAY_SERVER_ADDRESS:?set in config.env}"
+  : "${SOCKS_PORT:=10808}"
+}
+
+pid_alive() {
+  # ps, not kill -0: xray/tun2socks run as root (started via sudo), and
+  # `kill -0` on someone else's process fails with EPERM regardless of
+  # whether it's alive, which made `status` lie about "not running" for
+  # any non-root caller. ps just queries the process table - no signal,
+  # no permission check.
+  local pid="${1:-}"
+  [[ -n "$pid" ]] && ps -p "$pid" >/dev/null 2>&1
+}
+
+wait_for_port() {
+  local host="$1" port="$2" tries="${3:-20}"
+  while (( tries-- > 0 )); do
+    nc -z "$host" "$port" 2>/dev/null && return 0
+    sleep 0.25
+  done
+  return 1
+}
+
+resolve_ips() {
+  local host="$1"
+  if command -v dig >/dev/null 2>&1; then
+    dig +short A "$host" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' || true
+  else
+    python3 -c "import socket; print('\n'.join(sorted(set(i[4][0] for i in socket.getaddrinfo('$host', None, socket.AF_INET)))))" 2>/dev/null || true
+  fi
+}
+
+default_route_info() {
+  local info gw iface
+  info="$(route -n get default 2>/dev/null)" || die "no default route found on this machine"
+  gw="$(awk '/gateway:/{print $2}' <<<"$info")"
+  iface="$(awk '/interface:/{print $2}' <<<"$info")"
+  [[ -n "$gw" && -n "$iface" ]] || die "couldn't parse default route"
+  printf '%s %s\n' "$gw" "$iface"
+}
+
+active_network_service() {
+  if [[ -n "${NETWORK_SERVICE:-}" ]]; then
+    printf '%s\n' "$NETWORK_SERVICE"
+    return
+  fi
+  local _ iface="$1" order name dev
+  order="$(networksetup -listnetworkserviceorder)"
+  name=""
+  while IFS= read -r line; do
+    if [[ "$line" =~ ^\([0-9]+\)\ (.+)$ ]]; then
+      name="${BASH_REMATCH[1]}"
+    elif [[ "$line" =~ Device:\ ([a-zA-Z0-9]+) ]]; then
+      dev="${BASH_REMATCH[1]}"
+      if [[ "$dev" == "$iface" ]]; then
+        printf '%s\n' "$name"
+        return
+      fi
+    fi
+  done <<<"$order"
+  die "couldn't auto-detect the network service for interface $iface; set NETWORK_SERVICE in config.env"
+}
+
+get_current_dns() {
+  local service="$1" out
+  out="$(networksetup -getdnsservers "$service" 2>/dev/null || true)"
+  if [[ "$out" == *"aren't any DNS Servers"* ]]; then
+    printf 'Empty'
+  else
+    tr '\n' ' ' <<<"$out"
+  fi
+}
+
+get_ipv6_mode() {
+  local service="$1"
+  networksetup -getinfo "$service" 2>/dev/null | awk -F': ' '/^IPv6: /{print $2; exit}'
+}
+
+restore_ipv6_mode() {
+  local service="$1" mode="$2"
+  case "$mode" in
+    Automatic) networksetup -setv6automatic "$service" >/dev/null 2>&1 || true ;;
+    Off) networksetup -setv6off "$service" >/dev/null 2>&1 || true ;;
+    *)
+      # Manual/LinkLocal configs aren't captured in full; Automatic is the
+      # safest restore, but flag it since it may not match what you had.
+      err "IPv6 on '$service' was '$mode' before - restoring to Automatic (closest safe default, may not be an exact match)"
+      networksetup -setv6automatic "$service" >/dev/null 2>&1 || true
+      ;;
+  esac
+}
+
+# tun2socks (macOS) wants an explicit, currently-unused utun name; it creates
+# the device itself once started. Pick one starting from utun9 to steer clear
+# of low-numbered utuns already used by iCloud Private Relay / other VPNs.
+next_utun_name() {
+  local existing n=9
+  existing="$(ifconfig -l | tr ' ' '\n' | grep '^utun' || true)"
+  while printf '%s\n' "$existing" | grep -qx "utun$n"; do
+    n=$((n + 1))
+  done
+  printf 'utun%d\n' "$n"
+}
+
+wait_for_iface() {
+  local dev="$1" tries="${2:-20}"
+  while (( tries-- > 0 )); do
+    ifconfig -l | tr ' ' '\n' | grep -qx "$dev" && return 0
+    sleep 0.25
+  done
+  return 1
+}
+
+# Partition of IPv4 space tun2socks' own docs recommend for macOS (excludes
+# 0.0.0.0/8, and every block here is more general than any real LAN's /24 or
+# /16, so existing directly-connected routes for your local network still win
+# on longest-prefix-match and keep working untouched).
+TUN_ROUTE_CIDRS=(1.0.0.0/8 2.0.0.0/7 4.0.0.0/6 8.0.0.0/5 16.0.0.0/4 32.0.0.0/3 64.0.0.0/2 128.0.0.0/1 198.18.0.0/15)
+TUN_LOCAL_IP="198.18.0.1"
+
+# ---------- xray config + process ----------
+
+gen_xray_config() {
+  cat >"$XRAY_CONFIG" <<EOF
+{
+  "log": { "loglevel": "${XRAY_LOGLEVEL:-warning}" },
+  "inbounds": [{
+    "tag": "socks-in",
+    "port": ${SOCKS_PORT},
+    "listen": "127.0.0.1",
+    "protocol": "socks",
+    "settings": { "udp": true, "ip": "127.0.0.1" }
+  }],
+  "outbounds": [{
+    "tag": "proxy",
+    "protocol": "vless",
+    "settings": {
+      "vnext": [{
+        "address": "${XRAY_SERVER_ADDRESS}",
+        "port": ${XRAY_SERVER_PORT},
+        "users": [{
+          "id": "${XRAY_UUID}",
+          "flow": "${XRAY_FLOW}",
+          "encryption": "none"
+        }]
+      }]
+    },
+    "streamSettings": {
+      "network": "tcp",
+      "security": "reality",
+      "realitySettings": {
+        "serverName": "${XRAY_REALITY_SERVER_NAME}",
+        "fingerprint": "${XRAY_REALITY_FINGERPRINT}",
+        "publicKey": "${XRAY_REALITY_PUBLIC_KEY}",
+        "shortId": "${XRAY_REALITY_SHORT_ID}",
+        "spiderX": "/"
+      }
+    }
+  }]
+}
+EOF
+}
+
+start_xray() {
+  if pid_alive "$(cat "$XRAY_PIDFILE" 2>/dev/null || true)"; then
+    log "xray already running (pid $(cat "$XRAY_PIDFILE"))"
+    return 0
+  fi
+  gen_xray_config
+  "$XRAY_BIN" -c "$XRAY_CONFIG" >"$XRAY_LOG" 2>&1 &
+  echo $! >"$XRAY_PIDFILE"
+  disown || true
+  wait_for_port 127.0.0.1 "$SOCKS_PORT" 20 || { err "xray didn't come up; tail of $XRAY_LOG:"; tail -20 "$XRAY_LOG" >&2 || true; return 1; }
+  log "xray up (pid $(cat "$XRAY_PIDFILE"), socks 127.0.0.1:${SOCKS_PORT})"
+}
+
+stop_xray() {
+  local pid; pid="$(cat "$XRAY_PIDFILE" 2>/dev/null || true)"
+  if pid_alive "$pid"; then kill "$pid" 2>/dev/null || true; sleep 0.3; kill -9 "$pid" 2>/dev/null || true; fi
+  rm -f "$XRAY_PIDFILE"
+}
+
+# ---------- tun mode ----------
+
+start_tun() {
+  local auto_yes="$1"
+  [[ -f "$STATE_FILE" ]] && die "already running (state file present). Run 'xraywrap stop' first, or 'xraywrap panic' if it's stuck."
+  [[ -x "$XRAY_BIN" ]] || die "xray binary missing; run: sudo $0 install"
+  [[ -x "$TUN2SOCKS_BIN" ]] || die "tun2socks binary missing; run: sudo $0 install"
+
+  read -r ORIG_GATEWAY ORIG_IFACE < <(default_route_info)
+  local ips; ips="$(resolve_ips "$XRAY_SERVER_ADDRESS")"
+  [[ -n "$ips" ]] || die "couldn't resolve $XRAY_SERVER_ADDRESS to an IP"
+  local service; service="$(active_network_service "$ORIG_IFACE")"
+  local orig_dns; orig_dns="$(get_current_dns "$service")"
+  local orig_ipv6; orig_ipv6="$(get_ipv6_mode "$service")"
+
+  local tun_dev; tun_dev="$(next_utun_name)"
+
+  log "About to make these changes:"
+  log "  - host route(s) for $XRAY_SERVER_ADDRESS ($ips) via $ORIG_GATEWAY/$ORIG_IFACE  (loop prevention)"
+  log "  - create $tun_dev, assign $TUN_LOCAL_IP, route the bulk of IPv4 space through it"
+  if [[ -n "$orig_ipv6" && "$orig_ipv6" != "Off" ]]; then
+    log "  - IPv6 on '$service' -> Off (currently: $orig_ipv6). We only tunnel IPv4; leaving IPv6 on would leak straight past it."
+  fi
+  if [[ -n "${TUN_DNS_SERVERS:-}" ]]; then
+    log "  - DNS on '$service' -> $TUN_DNS_SERVERS (currently: $orig_dns)"
+  fi
+  if [[ "$auto_yes" != "yes" ]]; then
+    read -r -p "[xraywrap] Proceed? [y/N] " reply
+    [[ "$reply" =~ ^[Yy]$ ]] || die "aborted"
+  fi
+
+  start_xray || die "aborting: xray failed to start"
+
+  "$TUN2SOCKS_BIN" --device "$tun_dev" --proxy "socks5://127.0.0.1:${SOCKS_PORT}" --interface "$ORIG_IFACE" --loglevel info >"$TUN2SOCKS_LOG" 2>&1 &
+  echo $! >"$TUN2SOCKS_PIDFILE"
+  disown || true
+
+  if ! wait_for_iface "$tun_dev" 20; then
+    err "tun2socks didn't create $tun_dev; tail of $TUN2SOCKS_LOG:"; tail -20 "$TUN2SOCKS_LOG" >&2 || true
+    stop_xray; kill "$(cat "$TUN2SOCKS_PIDFILE" 2>/dev/null)" 2>/dev/null || true; rm -f "$TUN2SOCKS_PIDFILE"
+    ifconfig "$tun_dev" destroy >/dev/null 2>&1 || true
+    die "aborting"
+  fi
+  if ! ifconfig "$tun_dev" "$TUN_LOCAL_IP" "$TUN_LOCAL_IP" up; then
+    err "failed to bring up $tun_dev"
+    stop_xray; kill "$(cat "$TUN2SOCKS_PIDFILE" 2>/dev/null)" 2>/dev/null || true; rm -f "$TUN2SOCKS_PIDFILE"
+    ifconfig "$tun_dev" destroy >/dev/null 2>&1 || true
+    die "aborting"
+  fi
+  log "tun2socks up (pid $(cat "$TUN2SOCKS_PIDFILE"), device $tun_dev @ $TUN_LOCAL_IP)"
+
+  # Write state now, before touching the routing table, so that ANY failure
+  # from here on can be cleaned up via the normal stop_tun path instead of
+  # leaving a half-configured routing table with nothing to undo it.
+  cat >"$STATE_FILE" <<EOF
+MODE=tun
+TUN_DEVICE=$tun_dev
+ORIG_GATEWAY=$ORIG_GATEWAY
+ORIG_IFACE=$ORIG_IFACE
+BYPASS_IPS="$(tr '\n' ' ' <<<"$ips")"
+SERVICE="$service"
+DNS_CHANGED=false
+ORIG_DNS="$orig_dns"
+IPV6_CHANGED=false
+ORIG_IPV6="$orig_ipv6"
+EOF
+
+  if [[ -n "$orig_ipv6" && "$orig_ipv6" != "Off" ]]; then
+    if networksetup -setv6off "$service"; then
+      sed -i '' 's/^IPV6_CHANGED=.*/IPV6_CHANGED=true/' "$STATE_FILE"
+    else
+      err "failed to disable IPv6; rolling back (leaving it on risks leaking traffic outside the tunnel)"
+      stop_tun
+      die "rolled back"
+    fi
+  fi
+
+  local ip
+  while IFS= read -r ip; do
+    [[ -n "$ip" ]] || continue
+    route add -host "$ip" "$ORIG_GATEWAY" >/dev/null 2>&1 || err "failed to add bypass route for $ip (loop risk for that IP)"
+  done <<<"$ips"
+
+  for cidr in "${TUN_ROUTE_CIDRS[@]}"; do
+    if ! route add -net "$cidr" "$TUN_LOCAL_IP" >/dev/null 2>&1; then
+      err "failed to install route for $cidr; rolling back"
+      stop_tun
+      die "rolled back"
+    fi
+  done
+
+  if [[ -n "${TUN_DNS_SERVERS:-}" ]]; then
+    if networksetup -setdnsservers "$service" $TUN_DNS_SERVERS; then
+      sed -i '' 's/^DNS_CHANGED=.*/DNS_CHANGED=true/' "$STATE_FILE"
+    else
+      err "failed to set DNS; rolling back"
+      stop_tun
+      die "rolled back"
+    fi
+  fi
+
+  log "waiting ${STARTUP_GRACE_SECONDS:-3}s then running a connectivity self-test..."
+  sleep "${STARTUP_GRACE_SECONDS:-3}"
+
+  if curl -s -m 8 -o /dev/null -w '' https://www.google.com; then
+    local ext_ip; ext_ip="$(curl -s -m 8 https://ifconfig.me || true)"
+    log "self-test passed. Whole-system external IP is now: ${ext_ip:-unknown}"
+    log "tun mode is up."
+  else
+    err "self-test FAILED (no connectivity through the tunnel). Rolling back automatically."
+    stop_tun
+    die "rolled back. Check $XRAY_LOG and $TUN2SOCKS_LOG for what went wrong."
+  fi
+}
+
+stop_tun() {
+  [[ -f "$STATE_FILE" ]] || { log "not running (no state file)"; return 0; }
+  # shellcheck disable=SC1090
+  source "$STATE_FILE"
+
+  for cidr in "${TUN_ROUTE_CIDRS[@]}"; do
+    route delete -net "$cidr" >/dev/null 2>&1 || true
+  done
+
+  for ip in ${BYPASS_IPS:-}; do
+    route delete -host "$ip" "${ORIG_GATEWAY:-}" >/dev/null 2>&1 || true
+  done
+
+  if [[ "${DNS_CHANGED:-false}" == "true" && -n "${SERVICE:-}" ]]; then
+    if [[ "${ORIG_DNS:-Empty}" == "Empty" || -z "${ORIG_DNS:-}" ]]; then
+      networksetup -setdnsservers "$SERVICE" Empty >/dev/null 2>&1 || true
+    else
+      networksetup -setdnsservers "$SERVICE" ${ORIG_DNS} >/dev/null 2>&1 || true
+    fi
+  fi
+
+  if [[ "${IPV6_CHANGED:-false}" == "true" && -n "${SERVICE:-}" ]]; then
+    restore_ipv6_mode "$SERVICE" "${ORIG_IPV6:-Automatic}"
+  fi
+
+  local tpid; tpid="$(cat "$TUN2SOCKS_PIDFILE" 2>/dev/null || true)"
+  if pid_alive "$tpid"; then kill "$tpid" 2>/dev/null || true; sleep 0.3; kill -9 "$tpid" 2>/dev/null || true; fi
+  rm -f "$TUN2SOCKS_PIDFILE"
+  [[ -n "${TUN_DEVICE:-}" ]] && ifconfig "$TUN_DEVICE" destroy >/dev/null 2>&1 || true
+
+  stop_xray
+  rm -f "$STATE_FILE"
+  log "tun mode stopped, routes/DNS restored."
+}
+
+# ---------- socks mode ----------
+
+start_socks() {
+  [[ -f "$STATE_FILE" ]] && die "already running (state file present). Run 'xraywrap stop' first."
+  [[ -x "$XRAY_BIN" ]] || die "xray binary missing; run: sudo $0 install"
+  read -r _ ORIG_IFACE < <(default_route_info)
+  local service; service="$(active_network_service "$ORIG_IFACE")"
+
+  start_xray || die "aborting: xray failed to start"
+  networksetup -setsocksfirewallproxy "$service" 127.0.0.1 "$SOCKS_PORT"
+  networksetup -setsocksfirewallproxystate "$service" on
+
+  cat >"$STATE_FILE" <<EOF
+MODE=socks
+SERVICE="$service"
+EOF
+
+  if curl -s -m 8 --socks5-hostname "127.0.0.1:${SOCKS_PORT}" -o /dev/null https://www.google.com; then
+    local ext_ip; ext_ip="$(curl -s -m 8 --socks5-hostname "127.0.0.1:${SOCKS_PORT}" https://ifconfig.me || true)"
+    log "self-test passed. Proxy exit IP: ${ext_ip:-unknown}"
+    log "socks mode is up (system SOCKS proxy set on '$service')."
+  else
+    err "self-test FAILED. Rolling back."
+    stop_socks
+    die "rolled back."
+  fi
+}
+
+stop_socks() {
+  [[ -f "$STATE_FILE" ]] || { log "not running (no state file)"; return 0; }
+  # shellcheck disable=SC1090
+  source "$STATE_FILE"
+  if [[ -n "${SERVICE:-}" ]]; then
+    networksetup -setsocksfirewallproxystate "$SERVICE" off >/dev/null 2>&1 || true
+  fi
+  stop_xray
+  rm -f "$STATE_FILE"
+  log "socks mode stopped, system proxy disabled."
+}
+
+# ---------- dispatch-level commands ----------
+
+cmd_install() {
+  require_macos
+  local arch; arch="$(uname -m)"
+  local xray_pkg tun_pkg
+  case "$arch" in
+    arm64)  xray_pkg="Xray-macos-arm64-v8a.zip"; tun_pkg="tun2socks-darwin-arm64.zip" ;;
+    x86_64) xray_pkg="Xray-macos-64.zip";        tun_pkg="tun2socks-darwin-amd64.zip" ;;
+    *) die "unsupported arch: $arch" ;;
+  esac
+
+  local tmp; tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' RETURN
+
+  if [[ -x "$XRAY_BIN" && "${1:-}" != "--force" ]]; then
+    log "xray already installed at $XRAY_BIN (use install --force to redownload)"
+  else
+    log "downloading $xray_pkg ..."
+    curl -fL -o "$tmp/xray.zip" "https://github.com/XTLS/Xray-core/releases/latest/download/${xray_pkg}"
+    unzip -o -j "$tmp/xray.zip" xray -d "$VENDOR_DIR" >/dev/null
+    chmod +x "$XRAY_BIN"
+    log "installed $XRAY_BIN"
+  fi
+
+  if [[ -x "$TUN2SOCKS_BIN" && "${1:-}" != "--force" ]]; then
+    log "tun2socks already installed at $TUN2SOCKS_BIN (use install --force to redownload)"
+  else
+    log "downloading $tun_pkg ..."
+    curl -fL -o "$tmp/tun2socks.zip" "https://github.com/xjasonlyu/tun2socks/releases/latest/download/${tun_pkg}"
+    unzip -o -j "$tmp/tun2socks.zip" -d "$tmp/tun2socks-extracted" >/dev/null
+    local found; found="$(find "$tmp/tun2socks-extracted" -type f -perm -u+x | head -1)"
+    [[ -n "$found" ]] || found="$(find "$tmp/tun2socks-extracted" -type f | head -1)"
+    cp "$found" "$TUN2SOCKS_BIN"
+    chmod +x "$TUN2SOCKS_BIN"
+    log "installed $TUN2SOCKS_BIN"
+  fi
+  log "install complete."
+}
+
+cmd_status() {
+  echo "=== xraywrap status ==="
+  if [[ -f "$STATE_FILE" ]]; then
+    # shellcheck disable=SC1090
+    source "$STATE_FILE"
+    echo "mode:        ${MODE:-unknown}"
+  else
+    echo "mode:        stopped"
+  fi
+  local xpid tpid
+  xpid="$(cat "$XRAY_PIDFILE" 2>/dev/null || true)"
+  tpid="$(cat "$TUN2SOCKS_PIDFILE" 2>/dev/null || true)"
+  echo "xray:        $(pid_alive "$xpid" && echo "running (pid $xpid)" || echo "not running")"
+  echo "tun2socks:   $(pid_alive "$tpid" && echo "running (pid $tpid)" || echo "not running")"
+  echo "--- routing ---"
+  route -n get default 2>/dev/null | sed 's/^/  /'
+  echo "  tun-mode routes present: $(netstat -rn -f inet 2>/dev/null | awk '{print $1}' | grep -qE '^128\.0(\.0\.0)?/1$' && echo yes || echo no)"
+  echo "  IPv6 on '${SERVICE:-?}': $([[ -n "${SERVICE:-}" ]] && get_ipv6_mode "$SERVICE" || echo "n/a")"
+  echo "--- external IP, whole-system path (this is what sites actually see) ---"
+  printf '  IPv4: '; curl -4 -s -m 6 https://ifconfig.me || echo "(unreachable)"
+  echo
+  printf '  IPv6: '; curl -6 -s -m 6 https://ifconfig.me || echo "(unreachable/disabled)"
+  echo
+  if [[ "${MODE:-}" == "tun" ]]; then
+    echo "  (in tun mode, IPv4 above should match the tunnel's exit IP, and IPv6 should say unreachable - IPv6 is intentionally turned off to prevent it leaking around the tunnel)"
+  fi
+  if pid_alive "$xpid"; then
+    echo "--- external IP, explicitly via local SOCKS (sanity check that xray itself still works) ---"
+    curl -s -m 6 --socks5-hostname "127.0.0.1:${SOCKS_PORT}" https://ifconfig.me || echo "(unreachable)"
+    echo
+  fi
+}
+
+cmd_doctor() {
+  echo "=== xraywrap doctor ==="
+  echo "-- clock --"
+  date -u
+  curl -sI -m 6 https://www.google.com 2>/dev/null | grep -i '^date:' || echo "  couldn't fetch reference time"
+
+  echo "-- DNS resolution --"
+  resolve_ips "$XRAY_SERVER_ADDRESS" | sed 's/^/  resolved to: /' || echo "  FAILED to resolve $XRAY_SERVER_ADDRESS"
+
+  if [[ -f "$STATE_FILE" ]]; then
+    # shellcheck disable=SC1090
+    source "$STATE_FILE"
+    if [[ "${MODE:-}" == "tun" ]]; then
+      echo "-- loop-prevention route check --"
+      for ip in ${BYPASS_IPS:-}; do
+        if netstat -rn -f inet 2>/dev/null | awk '{print $1}' | grep -qx "$ip"; then
+          echo "  OK: bypass route present for $ip"
+        else
+          echo "  ** LOOP RISK **: no bypass route found for $ip (server traffic may be recursing through the tunnel)"
+        fi
+      done
+    fi
+  else
+    echo "-- not currently running --"
+  fi
+
+  echo "-- recent errors in logs --"
+  for f in "$XRAY_LOG" "$TUN2SOCKS_LOG"; do
+    [[ -f "$f" ]] || continue
+    echo "  $f:"
+    grep -iE 'error|failed|fatal' "$f" | tail -10 | sed 's/^/    /' || true
+  done
+
+  echo "-- connectivity --"
+  curl -s -o /dev/null -w "  google.com: HTTP %{http_code} in %{time_total}s\n" -m 8 https://www.google.com || echo "  google.com: unreachable"
+}
+
+cmd_logs() {
+  local which="${1:-both}" follow="${2:-}"
+  local files=()
+  case "$which" in
+    xray) files=("$XRAY_LOG") ;;
+    tun2socks) files=("$TUN2SOCKS_LOG") ;;
+    both|"") files=("$XRAY_LOG" "$TUN2SOCKS_LOG") ;;
+    -f) files=("$XRAY_LOG" "$TUN2SOCKS_LOG"); follow="-f" ;;
+    *) die "unknown log target: $which (expected xray|tun2socks)" ;;
+  esac
+  if [[ "$follow" == "-f" || "$which" == "-f" ]]; then
+    tail -f "${files[@]}"
+  else
+    tail -n 100 "${files[@]}"
+  fi
+}
+
+cmd_panic() {
+  need_root panic
+  log "PANIC: force-restoring networking regardless of state file."
+  pkill -f "$XRAY_BIN" 2>/dev/null || true
+  pkill -f "$TUN2SOCKS_BIN" 2>/dev/null || true
+  for cidr in "${TUN_ROUTE_CIDRS[@]}"; do
+    route delete -net "$cidr" >/dev/null 2>&1 || true
+  done
+  if [[ -f "$STATE_FILE" ]]; then
+    # shellcheck disable=SC1090
+    source "$STATE_FILE"
+    for ip in ${BYPASS_IPS:-}; do
+      route delete -host "$ip" "${ORIG_GATEWAY:-}" >/dev/null 2>&1 || true
+    done
+    [[ -n "${TUN_DEVICE:-}" ]] && ifconfig "$TUN_DEVICE" destroy >/dev/null 2>&1 || true
+  fi
+  for dev in $(ifconfig -l | tr ' ' '\n' | grep '^utun'); do
+    ifconfig "$dev" 2>/dev/null | grep -q "$TUN_LOCAL_IP" && ifconfig "$dev" destroy >/dev/null 2>&1 || true
+  done
+  while IFS= read -r svc; do
+    [[ "$svc" == \** ]] && continue
+    [[ -z "$svc" || "$svc" == "An asterisk"* ]] && continue
+    networksetup -setsocksfirewallproxystate "$svc" off >/dev/null 2>&1 || true
+    networksetup -setdnsservers "$svc" Empty >/dev/null 2>&1 || true
+    networksetup -setv6automatic "$svc" >/dev/null 2>&1 || true
+  done < <(networksetup -listallnetworkservices | tail -n +2)
+  rm -f "$STATE_FILE" "$XRAY_PIDFILE" "$TUN2SOCKS_PIDFILE"
+  log "done. Check 'route -n get default' and browse to confirm normal connectivity."
+}
+
+cmd_uninstall() {
+  need_root uninstall
+  if [[ -f "$STATE_FILE" ]]; then
+    load_config
+    if grep -q '^MODE=socks' "$STATE_FILE"; then stop_socks; else stop_tun; fi
+  fi
+  cmd_disable || true
+  rm -rf "$VENDOR_DIR"/* "$RUN_DIR"/* "$LOG_DIR"/*
+  log "removed vendored binaries and runtime state (kept etc/config.env)."
+}
+
+LAUNCHD_PLIST=/Library/LaunchDaemons/com.xraywrap.tunnel.plist
+LAUNCHD_LABEL=com.xraywrap.tunnel
+
+cmd_enable() {
+  need_root enable
+  cat >"$LAUNCHD_PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>${LAUNCHD_LABEL}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>${SCRIPT_DIR}/xraywrap</string>
+    <string>start</string>
+    <string>tun</string>
+    <string>--yes</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <false/>
+  <key>StandardOutPath</key>
+  <string>${LOG_DIR}/launchd.log</string>
+  <key>StandardErrorPath</key>
+  <string>${LOG_DIR}/launchd.log</string>
+</dict>
+</plist>
+EOF
+  chown root:wheel "$LAUNCHD_PLIST"
+  chmod 644 "$LAUNCHD_PLIST"
+  launchctl unload "$LAUNCHD_PLIST" >/dev/null 2>&1 || true
+  launchctl load -w "$LAUNCHD_PLIST"
+  log "enabled: tun mode will start automatically at boot (launchd job: ${LAUNCHD_LABEL})"
+  log "test it now without rebooting: sudo launchctl kickstart -k system/${LAUNCHD_LABEL}"
+  log "disable any time with: sudo xraywrap disable"
+}
+
+cmd_disable() {
+  need_root disable
+  if [[ -f "$LAUNCHD_PLIST" ]]; then
+    launchctl unload "$LAUNCHD_PLIST" >/dev/null 2>&1 || true
+    rm -f "$LAUNCHD_PLIST"
+    log "disabled: removed the launchd job. (the tunnel itself, if currently up, is untouched — run 'xraywrap stop' separately)"
+  else
+    log "not enabled (no launchd job present)"
+  fi
+}
+
+usage() {
+  sed -n '2,26p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+}
+
+# ---------- main ----------
+
+require_macos
+cmd="${1:-help}"; shift || true
+
+case "$cmd" in
+  install) cmd_install "${1:-}" ;;
+  start)
+    load_config
+    mode="tun"; auto_yes="no"
+    for a in "$@"; do
+      case "$a" in
+        tun|socks) mode="$a" ;;
+        --yes|-y) auto_yes="yes" ;;
+      esac
+    done
+    need_root start "$mode"
+    if [[ "$mode" == "tun" ]]; then start_tun "$auto_yes"; else start_socks; fi
+    ;;
+  stop)
+    load_config
+    need_root stop
+    if [[ -f "$STATE_FILE" ]] && grep -q '^MODE=socks' "$STATE_FILE"; then stop_socks; else stop_tun; fi
+    ;;
+  restart)
+    load_config
+    mode="tun"
+    for a in "$@"; do [[ "$a" == "tun" || "$a" == "socks" ]] && mode="$a"; done
+    need_root restart "$mode"
+    if [[ -f "$STATE_FILE" ]]; then
+      if grep -q '^MODE=socks' "$STATE_FILE"; then stop_socks; else stop_tun; fi
+    fi
+    if [[ "$mode" == "tun" ]]; then start_tun "yes"; else start_socks; fi
+    ;;
+  status) load_config; cmd_status ;;
+  doctor) load_config; cmd_doctor ;;
+  logs) cmd_logs "${1:-both}" "${2:-}" ;;
+  panic) load_config; cmd_panic ;;
+  uninstall) load_config; cmd_uninstall ;;
+  enable) load_config; cmd_enable ;;
+  disable) cmd_disable ;;
+  help|-h|--help) usage ;;
+  *) usage; die "unknown command: $cmd" ;;
+esac
