@@ -16,6 +16,9 @@ This downloads `xray` + `tun2socks` and symlinks `xraywrap` onto your PATH
 anywhere:
 
 ```
+xraywrap setup 'vless://uuid@host:port?...&security=reality&...#label'
+                         # writes etc/config.env from a share link (the kind
+                         # x-ui/3x-ui etc. generate for a client) - quote it!
 xraywrap start           # tun mode: whole machine, on by default
 xraywrap start socks     # lighter alternative: system SOCKS proxy only
 xraywrap status
@@ -36,6 +39,22 @@ run if it's missing) — edit it, then `sudo xraywrap restart`.
 
 Didn't run the installer? Everything above also works as
 `sudo /Users/budd/dev/xraywrap/bin/xraywrap <command>`.
+
+## `xraywrap setup` — importing a connection string
+
+`xraywrap setup '<vless-uri>'` parses a `vless://` share link and writes
+`etc/config.env` for you — no root, just a file write. It pulls out the
+UUID, host, port, flow, and the `sni`/`fp`/`pbk`/`sid` Reality params, and
+refuses to proceed if the link isn't `security=reality` + `type=tcp` (the
+only combination the generated `xray-client.json` template supports —
+plain TLS, ws, grpc, etc. links will get a clear error instead of a
+silently-broken config). Re-running it preserves your existing
+`SOCKS_PORT`/`TUN_DNS_SERVERS`/`NETWORK_SERVICE`/`STARTUP_GRACE_SECONDS`
+settings and backs up the previous `config.env` (timestamped, alongside
+it) before overwriting.
+
+**Quote the URI** — it contains `&`, which your shell will otherwise treat
+as "run this in the background" and truncate the string.
 
 ## How "tun" mode works
 
