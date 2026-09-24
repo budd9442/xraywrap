@@ -3,7 +3,7 @@
 A macOS wrapper around your Xray (VLESS + Reality) client that can force
 **all** of your Mac's traffic through it, or just set it as the system
 proxy — managed with simple commands, with automatic rollback if anything
-goes wrong.
+goes wrong
 
 ## One-time setup
 
